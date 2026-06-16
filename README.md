@@ -12,8 +12,7 @@ The default configs follow the paper-reported DGRN settings: 80%-10%-10% chronol
 
 ## Files
 
-- `train.py`: plain PyTorch training and evaluation script.
-- `train_bilevel.py`: bilevel training script with inner model-parameter updates and once-per-epoch latent-graph updates.
+- `train.py`: bilevel training and evaluation script with inner model-parameter updates and once-per-epoch latent-graph updates.
 - `dgrn/model.py`: the DGRN implementation, including physical graph filtering, latent graph learning, recurrent graph blocks, and forecast head.
 - `dgrn/data.py`: processed CSV loading, time features, scaling, and sliding-window datasets.
 - `configs/milan.yaml`, `configs/finland.yaml`, `configs/taiwan.yaml`: runnable dataset configs.
@@ -40,12 +39,6 @@ Other datasets:
 ```bash
 python train.py --config configs/finland.yaml
 python train.py --config configs/taiwan.yaml
-```
-
-Bilevel training:
-
-```bash
-python train_bilevel.py --config configs/milan.yaml
 ```
 
 For a quick smoke test:
