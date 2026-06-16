@@ -213,8 +213,8 @@ class DGRN(nn.Module):
 
     @torch.no_grad()
     def project_recurrent_taps(self, delta: float = 0.05) -> None:
-        # Paper implementation mechanism: enforce C_H < 1 through aggregate
-        # spectral projection of recurrent Chebyshev taps after inner updates.
+        # Enforce C_H < 1 through aggregate spectral projection of the recurrent
+        # Chebyshev taps after inner updates.
         c_max = 1.0 - delta
         for block in self.blocks:
             weight = block.cell.weight_rec

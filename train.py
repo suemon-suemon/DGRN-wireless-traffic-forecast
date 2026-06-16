@@ -23,9 +23,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def paper_loss(pred: torch.Tensor, x: torch.Tensor, mask: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    # With missing_ratio=0 this matches the paper code's if_missing=True loss
-    # shape, where reconstructed context and future prediction are concatenated.
+def reconstruction_forecast_loss(pred: torch.Tensor, x: torch.Tensor, mask: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # Concatenate the reconstructed input context with the forecast horizon, then
+    # take L1 over the full sequence (matches if_missing=True when missing_ratio=0).
     pred_full = torch.cat([x * mask, pred], dim=-1)
     target_full = torch.cat([x, y], dim=-1)
     return F.l1_loss(pred_full, target_full)
@@ -71,7 +71,7 @@ def average_loss(model: DGRN, batches) -> torch.Tensor:
     losses = []
     for x, mask, time_fea, y in batches:
         pred = model(x, mask, time_fea)
-        losses.append(paper_loss(pred, x, mask, y))
+        losses.append(reconstruction_forecast_loss(pred, x, mask, y))
     return torch.stack(losses).mean()
 
 
@@ -166,7 +166,7 @@ def run_inner_updates(
         x, mask, time_fea, y = move_batch(next(batches), device)
         optimizer.zero_grad(set_to_none=True)
         pred = model(x, mask, time_fea)
-        loss = paper_loss(pred, x, mask, y) + model.regularization_loss()
+        loss = reconstruction_forecast_loss(pred, x, mask, y) + model.regularization_loss()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.model_parameters(), grad_clip)
         optimizer.step()
