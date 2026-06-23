@@ -2,9 +2,10 @@ dataset: finland
 data_csv: data/finland_grid_data.csv
 physical_adj_csv: data/finland_0_7_0_8_adj_mx.csv
 latent_init_csv:
+seed: 42
 num_nodes: 72
 steps_per_day: 144
-time_range: 1.0
+time_range: 0.8
 train_ratio: 0.8
 val_ratio: 0.1
 close_len: 6
@@ -15,12 +16,13 @@ patience: 20
 learning_rate: 0.001
 inner_lr: 0.001
 inner_steps: 3
-outer_lr: 0.1
+outer_lr: 0.2
 ema_beta: 0.9
 outer_train_batches: 5
 outer_val_batches: 5
 outer_clip_tau: 1.0
-outer_ls_max_trials: 2
+outer_ls_max_trials: 4
+outer_lr_backtracking_factor: 0.8
 armijo_mu: 0.0001
 projection_delta: 0.05
 weight_decay: 0.0001
@@ -34,4 +36,3 @@ num_blocks: 3
 graph_l1: 0.0
 grad_clip: 5.0
 num_workers: 0
-include_history_in_metric: true

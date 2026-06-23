@@ -4,14 +4,17 @@ import argparse
 import copy
 import json
 import itertools
+import random
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 
 from dgrn.data import build_dataloaders, load_matrix
 from dgrn.model import DGRN
-from train import evaluate, load_config
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,18 +23,71 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", default="runs")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--latent-graph",
+        choices=("dense", "topk"),
+        default="dense",
+        help="latent graph generator; this command-line option intentionally does not read YAML",
+    )
     return parser.parse_args()
 
 
-def reconstruction_forecast_loss(pred: torch.Tensor, x: torch.Tensor, mask: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    # Concatenate the reconstructed input context with the forecast horizon, then
-    # take L1 over the full sequence (matches if_missing=True when missing_ratio=0).
-    pred_full = torch.cat([x * mask, pred], dim=-1)
-    target_full = torch.cat([x, y], dim=-1)
-    return F.l1_loss(pred_full, target_full)
+def load_config(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
-def build_model(cfg: dict, project_dir: Path, device: str) -> DGRN:
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def training_loss(pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return F.l1_loss(pred, y)
+
+
+def metrics(pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    pred_flat = pred.detach().cpu().reshape(-1).float()
+    target_flat = target.detach().cpu().reshape(-1).float()
+    diff = pred_flat - target_flat
+    mae = torch.mean(torch.abs(diff)).item()
+    rmse = torch.sqrt(torch.mean(diff.square())).item()
+    ss_res = diff.square().sum()
+    ss_tot = (target_flat - target_flat.mean()).square().sum()
+    r2 = (1.0 - ss_res / ss_tot).item() if ss_tot > 0 else float("nan")
+    return {"MAE": mae, "RMSE": rmse, "R2": r2}
+
+
+@torch.no_grad()
+def evaluate(model: DGRN, loader, scaler, device: str) -> dict[str, float]:
+    model.eval()
+    preds = []
+    targets = []
+    total_loss = 0.0
+    total_count = 0
+    for x, time_fea, y in loader:
+        x, time_fea, y = (
+            x.to(device),
+            time_fea.to(device),
+            y.to(device),
+        )
+        pred = model(x, time_fea)
+        total_loss += F.l1_loss(pred, y, reduction="sum").item()
+        total_count += y.numel()
+        preds.append(scaler.inverse_transform_tensor(pred).cpu())
+        targets.append(scaler.inverse_transform_tensor(y).cpu())
+
+    out = metrics(torch.cat(preds), torch.cat(targets))
+    out["_scaled_l1"] = total_loss / total_count
+    return out
+
+
+def build_model(cfg: dict, project_dir: Path, device: str, latent_graph: str = "dense") -> DGRN:
     physical_adj = load_matrix(project_dir / cfg["physical_adj_csv"])
     latent_init = None
     if cfg.get("latent_init_csv"):
@@ -53,12 +109,13 @@ def build_model(cfg: dict, project_dir: Path, device: str) -> DGRN:
         latent_init=latent_init,
         entmax_alpha=float(cfg.get("entmax_alpha", 1.5)),
         graph_l1=float(cfg.get("graph_l1", 0.0)),
+        latent_graph=latent_graph,
     ).to(device)
 
 
 def move_batch(batch, device: str):
-    x, mask, time_fea, y = batch
-    return x.to(device), mask.to(device), time_fea.to(device), y.to(device)
+    x, time_fea, y = batch
+    return x.to(device), time_fea.to(device), y.to(device)
 
 
 def collect_epoch_batches(loader, num_batches: int, device: str):
@@ -69,9 +126,9 @@ def collect_epoch_batches(loader, num_batches: int, device: str):
 
 def average_loss(model: DGRN, batches) -> torch.Tensor:
     losses = []
-    for x, mask, time_fea, y in batches:
-        pred = model(x, mask, time_fea)
-        losses.append(reconstruction_forecast_loss(pred, x, mask, y))
+    for x, time_fea, y in batches:
+        pred = model(x, time_fea)
+        losses.append(training_loss(pred, y))
     return torch.stack(losses).mean()
 
 
@@ -86,6 +143,7 @@ def bilevel_outer_step(
     clip_tau: float,
     armijo_mu: float,
     max_backtracking_steps: int,
+    backtracking_factor: float,
 ) -> tuple[torch.Tensor, bool, float]:
     model.train()
     model_params = model.model_parameters()
@@ -93,21 +151,26 @@ def bilevel_outer_step(
 
     val_loss = average_loss(model, val_batches)
     direct_grad = torch.autograd.grad(val_loss, graph_param, retain_graph=True)[0]
-    val_model_grads = torch.autograd.grad(val_loss, model_params, retain_graph=True, allow_unused=True)
 
+    # First-order DARTS hypergradient (Eq. (10) / Algorithm 1): the direct
+    # validation gradient plus the one-step indirect term that accounts for the
+    # dependence of the inner optimum on phi. The residual of this one-step
+    # approximation is the bias constant c_FO analyzed in the supplement.
+    val_model_grads = torch.autograd.grad(
+        val_loss, model_params, retain_graph=True, allow_unused=True
+    )
     train_loss = average_loss(model, train_batches)
-    train_model_grads = torch.autograd.grad(train_loss, model_params, create_graph=True, allow_unused=True)
-
+    train_model_grads = torch.autograd.grad(
+        train_loss, model_params, create_graph=True, allow_unused=True
+    )
     grad_dot = graph_param.new_tensor(0.0)
     for train_grad, val_grad in zip(train_model_grads, val_model_grads):
         if train_grad is None or val_grad is None:
             continue
         grad_dot = grad_dot + (train_grad * val_grad.detach()).sum()
-
     indirect_grad = torch.autograd.grad(grad_dot, graph_param, allow_unused=True)[0]
     if indirect_grad is None:
         indirect_grad = torch.zeros_like(graph_param)
-
     hyper_grad = direct_grad - inner_lr * indirect_grad
     if ema_buffer is None:
         ema_buffer = torch.zeros_like(hyper_grad)
@@ -123,7 +186,7 @@ def bilevel_outer_step(
     for attempt in range(max_backtracking_steps + 1):
         graph_param.data.copy_(old_graph)
         outer_optimizer.load_state_dict(old_state)
-        trial_lrs = [lr * (0.5**attempt) for lr in old_lrs]
+        trial_lrs = [lr * (backtracking_factor**attempt) for lr in old_lrs]
         for group, lr in zip(outer_optimizer.param_groups, trial_lrs):
             group["lr"] = lr
 
@@ -143,7 +206,7 @@ def bilevel_outer_step(
     if not accepted:
         graph_param.data.copy_(old_graph)
         outer_optimizer.load_state_dict(old_state)
-        trial_lrs = [lr * 0.5 for lr in old_lrs]
+        trial_lrs = [lr * backtracking_factor for lr in old_lrs]
 
     for group, lr in zip(outer_optimizer.param_groups, trial_lrs):
         group["lr"] = lr
@@ -163,10 +226,10 @@ def run_inner_updates(
     model.train()
     batches = itertools.cycle(loader)
     for _ in range(inner_steps):
-        x, mask, time_fea, y = move_batch(next(batches), device)
+        x, time_fea, y = move_batch(next(batches), device)
         optimizer.zero_grad(set_to_none=True)
-        pred = model(x, mask, time_fea)
-        loss = reconstruction_forecast_loss(pred, x, mask, y) + model.regularization_loss()
+        pred = model(x, time_fea)
+        loss = training_loss(pred, y) + model.regularization_loss()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.model_parameters(), grad_clip)
         optimizer.step()
@@ -180,12 +243,17 @@ def main() -> None:
     cfg = load_config(project_dir / args.config)
     if args.epochs is not None:
         cfg["epochs"] = args.epochs
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+
+    seed = int(cfg.get("seed", 42))
+    set_seed(seed)
 
     output_dir = project_dir / args.output_dir / cfg["dataset"]
     output_dir.mkdir(parents=True, exist_ok=True)
 
     train_loader, val_loader, test_loader, scaler, data_shape = build_dataloaders(cfg, project_dir)
-    model = build_model(cfg, project_dir, args.device)
+    model = build_model(cfg, project_dir, args.device, latent_graph=args.latent_graph)
 
     inner_lr = float(cfg.get("inner_lr", cfg.get("learning_rate", 1e-3)))
     outer_lr = float(cfg.get("outer_lr", 0.1))
@@ -197,6 +265,9 @@ def main() -> None:
     projection_delta = float(cfg.get("projection_delta", 0.05))
     armijo_mu = float(cfg.get("armijo_mu", 1e-4))
     max_backtracking_steps = int(cfg.get("outer_ls_max_trials", 2))
+    backtracking_factor = float(cfg.get("outer_lr_backtracking_factor", 0.8))
+    if not 0.0 < backtracking_factor < 1.0:
+        raise ValueError("outer_lr_backtracking_factor must be in (0, 1).")
 
     inner_optimizer = torch.optim.AdamW(
         model.model_parameters(),
@@ -224,8 +295,14 @@ def main() -> None:
         f"Scaler fit on train: min={scaler.data_min:.6g}, "
         f"max={scaler.data_max:.6g}, range={scaler.data_range:.6g}"
     )
+    num_params = sum(p.numel() for p in model.parameters())
+    num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Seed={seed} | Model params: total={num_params:,} trainable={num_trainable:,}")
 
+    train_start = time.perf_counter()
+    epochs_run = 0
     for epoch in range(1, int(cfg["epochs"]) + 1):
+        epochs_run = epoch
         run_inner_updates(
             model=model,
             loader=train_loader,
@@ -247,8 +324,9 @@ def main() -> None:
             ema_buffer=ema_buffer,
             ema_beta=ema_beta,
             clip_tau=clip_tau,
-            armijo_mu=armijo_mu,
-            max_backtracking_steps=max_backtracking_steps,
+        armijo_mu=armijo_mu,
+        max_backtracking_steps=max_backtracking_steps,
+        backtracking_factor=backtracking_factor,
         )
 
         val = evaluate(
@@ -256,7 +334,6 @@ def main() -> None:
             val_loader,
             scaler,
             args.device,
-            include_history_in_metric=bool(cfg.get("include_history_in_metric", True)),
         )
         print(
             f"epoch={epoch:03d} "
@@ -275,6 +352,12 @@ def main() -> None:
                 print(f"Early stopping at epoch {epoch}.")
                 break
 
+    train_seconds = time.perf_counter() - train_start
+    print(
+        f"Training finished: epochs_run={epochs_run} "
+        f"total_time={train_seconds:.1f}s ({train_seconds / 60:.2f} min)"
+    )
+
     if best_state is not None:
         model.load_state_dict(best_state)
 
@@ -283,9 +366,13 @@ def main() -> None:
         test_loader,
         scaler,
         args.device,
-        include_history_in_metric=bool(cfg.get("include_history_in_metric", True)),
     )
     test.pop("_scaled_l1", None)
+    test["seed"] = seed
+    test["num_params"] = num_params
+    test["num_trainable_params"] = num_trainable
+    test["epochs_run"] = epochs_run
+    test["train_seconds"] = round(train_seconds, 2)
     print("METRIC_JSON:", json.dumps(test, sort_keys=True))
 
     torch.save(model.state_dict(), output_dir / "best_model.pt")

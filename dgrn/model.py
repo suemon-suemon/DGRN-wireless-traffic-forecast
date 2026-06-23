@@ -1,11 +1,10 @@
 from __future__ import annotations
-
 from pathlib import Path
-
 import numpy as np
 import torch
 import torch.nn as nn
 from entmax import entmax_bisect
+torch.sparse.check_sparse_tensor_invariants.disable()
 
 
 def normalize_adj_add_self_loop(adj: torch.Tensor) -> torch.Tensor:
@@ -16,13 +15,46 @@ def normalize_adj_add_self_loop(adj: torch.Tensor) -> torch.Tensor:
     return adj * d_inv_sqrt[:, None] * d_inv_sqrt[None, :]
 
 
+def normalize_adj_sparse_add_self_loop(adj: torch.Tensor) -> torch.Tensor:
+    """Add self-loops and symmetrically normalize a sparse adjacency matrix."""
+    num_nodes = adj.size(0)
+    device = adj.device
+    indices = adj.coalesce().indices()
+    values = adj.coalesce().values()
+    self_indices = torch.arange(num_nodes, device=device)
+    all_indices = torch.cat(
+        [indices, torch.stack([self_indices, self_indices])], dim=1
+    )
+    all_values = torch.cat([values, torch.ones(num_nodes, device=device, dtype=values.dtype)])
+    adj = torch.sparse_coo_tensor(
+        all_indices, all_values, (num_nodes, num_nodes), device=device
+    ).coalesce()
+    degree = torch.zeros(num_nodes, device=device, dtype=adj.dtype).scatter_add_(
+        0, adj.indices()[0], adj.values()
+    )
+    d_inv_sqrt = degree.clamp_min(1e-6).pow(-0.5)
+    normalized_values = adj.values() * d_inv_sqrt[adj.indices()[0]] * d_inv_sqrt[adj.indices()[1]]
+    return torch.sparse_coo_tensor(
+        adj.indices(), normalized_values, adj.shape, device=device
+    ).coalesce()
+
+
+def graph_multiply(adj: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Apply an [N, N] dense or sparse graph shift to x shaped [B, F, N]."""
+    if not adj.is_sparse:
+        return torch.einsum("ij,bfj->bfi", adj, x)
+    num_nodes = x.size(-1)
+    flattened = x.permute(2, 0, 1).reshape(num_nodes, -1)
+    return torch.sparse.mm(adj, flattened).reshape(num_nodes, *x.shape[:2]).permute(1, 2, 0)
+
+
 def cheb_filter(x: torch.Tensor, adj: torch.Tensor, weight: torch.Tensor, bias=None) -> torch.Tensor:
     # x: [B, Fin, N], adj: [N, N], weight: [Fout, K, Fin]
     supports = [x]
     if weight.size(1) > 1:
-        supports.append(torch.einsum("ij,bfj->bfi", adj, x))
+        supports.append(graph_multiply(adj, x))
     for _ in range(2, weight.size(1)):
-        supports.append(2 * torch.einsum("ij,bfj->bfi", adj, supports[-1]) - supports[-2])
+        supports.append(2 * graph_multiply(adj, supports[-1]) - supports[-2])
     stacked = torch.stack(supports[: weight.size(1)], dim=2)
     out = torch.einsum("bfkn,okf->bon", stacked, weight)
     if bias is not None:
@@ -46,7 +78,7 @@ class DGRNCell(nn.Module):
         self.k_rec = k_rec
         self.weight_in = nn.Parameter(torch.empty(hidden_dim, k_in, input_dim))
         self.weight_rec = nn.Parameter(torch.empty(hidden_dim, k_rec, hidden_dim))
-        self.bias = nn.Parameter(torch.zeros(hidden_dim))
+        # self.bias = nn.Parameter(torch.zeros(hidden_dim))
         self.time_encoder = nn.Sequential(
             nn.Linear(time_input_dim, temporal_embed_dim),
             nn.ReLU(),
@@ -87,7 +119,7 @@ class DGRNCell(nn.Module):
             gamma_rec = torch.sigmoid(self.gamma_rec(time_embed)).unsqueeze(-1)
             term_in = gamma_in * term_in
             term_rec = gamma_rec * term_rec
-            h = torch.tanh(term_in + term_rec + self.bias.view(1, -1, 1))
+            h = torch.tanh(term_in + term_rec)
             states.append(h.unsqueeze(1))
         return torch.cat(states, dim=1)
 
@@ -141,6 +173,9 @@ class DGRN(nn.Module):
         latent_init: np.ndarray | None = None,
         entmax_alpha: float = 1.5,
         graph_l1: float = 0.0,
+        latent_graph: str = "dense",
+        topk_k: int = 12,
+        graph_embed_dim: int = 16,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -148,12 +183,27 @@ class DGRN(nn.Module):
         self.pred_len = pred_len
         self.entmax_alpha = entmax_alpha
         self.graph_l1 = graph_l1
+        if latent_graph not in {"dense", "topk"}:
+            raise ValueError(f"latent_graph must be 'dense' or 'topk', got {latent_graph!r}")
+        if topk_k < 1:
+            raise ValueError("topk_k must be positive")
+        if graph_embed_dim < 1:
+            raise ValueError("graph_embed_dim must be positive")
+        self.latent_graph = latent_graph
+        self.topk_k = topk_k
+        self.graph_embed_dim = graph_embed_dim
+        self._cached_inference_adj: torch.Tensor | None = None
         self.register_buffer(
-            "adj_phy", normalize_adj_add_self_loop(torch.from_numpy(physical_adj).float())
+            "adj_phy",
+            normalize_adj_add_self_loop(torch.from_numpy(physical_adj).float())
+            if latent_graph == "dense"
+            else normalize_adj_sparse_add_self_loop(torch.from_numpy(physical_adj).float().to_sparse_coo()),
         )
 
         edge_count = num_nodes * (num_nodes - 1) // 2
-        if latent_init is None:
+        if latent_graph == "topk":
+            logits = torch.randn(num_nodes, 2 * graph_embed_dim) * 0.1
+        elif latent_init is None:
             logits = torch.empty(edge_count)
             nn.init.xavier_uniform_(logits.unsqueeze(0))
             logits = logits.squeeze(0)
@@ -182,12 +232,22 @@ class DGRN(nn.Module):
             ]
         )
     def edge_weights(self) -> torch.Tensor:
+        if self.latent_graph == "topk":
+            raise RuntimeError("edge_weights is only defined for the dense latent graph")
         logits = torch.nan_to_num(self.edge_logits, nan=0.0, posinf=0.0, neginf=0.0).clamp(
             -30.0, 30.0
         )
         return entmax_bisect(logits.unsqueeze(0), alpha=self.entmax_alpha, dim=-1).squeeze(0)
 
     def latent_adj(self) -> torch.Tensor:
+        if self.latent_graph == "topk":
+            if not self.training and self._cached_inference_adj is not None:
+                return self._cached_inference_adj
+            adj = self._topk_latent_adj()
+            if not self.training:
+                self._cached_inference_adj = adj.detach()
+                return self._cached_inference_adj
+            return adj
         adj = torch.zeros(
             self.num_nodes,
             self.num_nodes,
@@ -197,11 +257,51 @@ class DGRN(nn.Module):
         triu = torch.triu_indices(self.num_nodes, self.num_nodes, offset=1, device=adj.device)
         weights = self.edge_weights()
         adj[triu[0], triu[1]] = weights
-        adj = adj + adj.t()
+        adj = (adj + adj.t()) * self.num_nodes * 0.5
         return normalize_adj_add_self_loop(adj)
 
+    def _topk_latent_adj(self) -> torch.Tensor:
+        num_nodes = self.num_nodes
+        k = min(self.topk_k, num_nodes - 1)
+        if k == 0:
+            empty_indices = torch.empty((2, 0), dtype=torch.long, device=self.edge_logits.device)
+            empty_values = torch.empty(0, dtype=self.edge_logits.dtype, device=self.edge_logits.device)
+            return normalize_adj_sparse_add_self_loop(
+                torch.sparse_coo_tensor(empty_indices, empty_values, (num_nodes, num_nodes)).coalesce()
+            )
+
+        first = self.edge_logits[:, : self.graph_embed_dim]
+        second = self.edge_logits[:, self.graph_embed_dim :]
+        with torch.no_grad():
+            scores = first @ second.t() + second @ first.t()
+            scores.fill_diagonal_(float("-inf"))
+            neighbor_positions = torch.topk(scores, k, dim=-1).indices
+            rows = torch.arange(num_nodes, device=scores.device).unsqueeze(1).expand(-1, k).reshape(-1)
+            cols = neighbor_positions.reshape(-1)
+            linear_indices = torch.unique(torch.cat([rows * num_nodes + cols, cols * num_nodes + rows]))
+            row_indices = torch.div(linear_indices, num_nodes, rounding_mode="floor")
+            col_indices = linear_indices % num_nodes
+
+        values = torch.sigmoid(
+            (first[row_indices] * second[col_indices]).sum(-1)
+            + (first[col_indices] * second[row_indices]).sum(-1)
+        )
+        adj = torch.sparse_coo_tensor(
+            torch.stack([row_indices, col_indices]), values, (num_nodes, num_nodes), device=values.device
+        ).coalesce()
+        return normalize_adj_sparse_add_self_loop(adj)
+
+    def train(self, mode: bool = True):
+        if mode:
+            self._cached_inference_adj = None
+        return super().train(mode)
+
+    def load_state_dict(self, state_dict, strict: bool = True, **kwargs):
+        self._cached_inference_adj = None
+        return super().load_state_dict(state_dict, strict=strict, **kwargs)
+
     def regularization_loss(self) -> torch.Tensor:
-        if self.graph_l1 <= 0:
+        if self.latent_graph == "topk" or self.graph_l1 <= 0:
             return self.edge_logits.new_tensor(0.0)
         return self.graph_l1 * self.edge_weights().mean()
 
@@ -230,8 +330,8 @@ class DGRN(nn.Module):
             if aggregate > tau:
                 weight.mul_(tau / aggregate.clamp_min(1e-8))
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, time_features: torch.Tensor) -> torch.Tensor:
-        residual = x * mask
+    def forward(self, x: torch.Tensor, time_features: torch.Tensor) -> torch.Tensor:
+        residual = x
         total_forecast = 0.0
         adj_latent = self.latent_adj()
         for block in self.blocks:
@@ -241,5 +341,8 @@ class DGRN(nn.Module):
         return total_forecast
 
     def save_latent_graph(self, path: str | Path) -> None:
-        adj = self.latent_adj().detach().cpu().numpy()
+        adj = self.latent_adj().detach()
+        if adj.is_sparse:
+            adj = adj.to_dense()
+        adj = adj.cpu().numpy()
         np.savetxt(path, adj, delimiter=",")

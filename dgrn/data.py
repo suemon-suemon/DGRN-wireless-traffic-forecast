@@ -61,11 +61,9 @@ class TrafficWindowDataset(Dataset):
 
         x = self.values[input_start:input_end].T
         y = self.values[out_start:output_end].T
-        mask = np.ones_like(x, dtype=np.float32)
         time_fea = make_time_features(np.arange(input_start, input_end), self.steps_per_day)
         return (
             torch.from_numpy(x),
-            torch.from_numpy(mask),
             torch.from_numpy(time_fea),
             torch.from_numpy(y),
         )
